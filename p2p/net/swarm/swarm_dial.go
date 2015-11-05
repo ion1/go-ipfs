@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"sort"
 	"sync"
@@ -148,24 +149,41 @@ func (ds *dialsync) Unlock(dst peer.ID) {
 //  }
 //
 type dialbackoff struct {
-	entries map[peer.ID]struct{}
+	// TODO entries can grow without bound at the moment.
+	entries map[peer.ID]time.Time // Entry's expiry time
 	lock    sync.RWMutex
+}
+
+func backoffDuration() time.Duration {
+	// Use a random duration between 10 and 20 minutes.  If a number of
+	// peers were added to the backoff list roughly simultaneously, avoid
+	// releasing them at the same time, potentially lessening the peak in
+	// resolve time if they are still unreachable.
+	coeff := 1 + rand.Float64()
+	return time.Duration(coeff * float64(10*time.Minute))
 }
 
 func (db *dialbackoff) init() {
 	if db.entries == nil {
-		db.entries = make(map[peer.ID]struct{})
+		db.entries = make(map[peer.ID]time.Time)
 	}
 }
 
-// Backoff returns whether the client should backoff from dialing
-// peeer p
+// Backoff returns whether the client should backoff from dialing peer p
 func (db *dialbackoff) Backoff(p peer.ID) bool {
 	db.lock.Lock()
+	defer db.lock.Unlock()
 	db.init()
-	_, found := db.entries[p]
-	db.lock.Unlock()
-	return found
+	eol, found := db.entries[p]
+	if !found {
+		return false
+	}
+	if eol.Before(time.Now()) {
+		// The backoff entry has expired.
+		delete(db.entries, p)
+		return false
+	}
+	return true
 }
 
 // AddBackoff lets other nodes know that we've entered backoff with
@@ -173,18 +191,18 @@ func (db *dialbackoff) Backoff(p peer.ID) bool {
 // attempt to dial with one goroutine, in case we get through.
 func (db *dialbackoff) AddBackoff(p peer.ID) {
 	db.lock.Lock()
+	defer db.lock.Unlock()
 	db.init()
-	db.entries[p] = struct{}{}
-	db.lock.Unlock()
+	db.entries[p] = time.Now().Add(backoffDuration())
 }
 
 // Clear removes a backoff record. Clients should call this after a
 // successful Dial.
 func (db *dialbackoff) Clear(p peer.ID) {
 	db.lock.Lock()
+	defer db.lock.Unlock()
 	db.init()
 	delete(db.entries, p)
-	db.lock.Unlock()
 }
 
 // Dial connects to a peer.
